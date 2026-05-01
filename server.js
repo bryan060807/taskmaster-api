@@ -115,7 +115,9 @@ async function ensureRecurringTasksTable() {
     )
   `);
 
-  await pool.query("CREATE INDEX IF NOT EXISTS recurring_tasks_user_id_created_at_idx ON recurring_tasks (user_id, created_at DESC)");
+  await pool.query(
+    "CREATE INDEX IF NOT EXISTS recurring_tasks_user_id_created_at_idx ON recurring_tasks (user_id, created_at DESC)"
+  );
 }
 
 function getAuthenticatedUserId(req) {
@@ -133,7 +135,7 @@ function getAuthenticatedUserId(req) {
 function mapTask(row) {
   return {
     id: row.id,
-    user_id: String(row.user_id),
+    userId: String(row.user_id),
     title: row.title,
     description: row.description,
     priority: row.priority,
@@ -144,28 +146,74 @@ function mapTask(row) {
     scheduledDate: row.scheduled_date,
     recurrenceId: row.recurrence_id,
     createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
+}
+
+function normalizeListItem(item) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) {
+    return null;
+  }
+
+  const id = item.id == null ? "" : String(item.id);
+  const textValue =
+    typeof item.text === "string" ? item.text : typeof item.title === "string" ? item.title : "";
+  const text = textValue.trim();
+
+  if (!id || !text) {
+    return null;
+  }
+
+  return {
+    id,
+    text,
+    isCompleted: item.isCompleted === true || item.is_completed === true,
+  };
+}
+
+function normalizeListItems(items) {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  const normalizedItems = [];
+  const seenItemIds = new Set();
+
+  for (const item of items) {
+    const normalizedItem = normalizeListItem(item);
+
+    if (!normalizedItem || seenItemIds.has(normalizedItem.id)) {
+      continue;
+    }
+
+    seenItemIds.add(normalizedItem.id);
+    normalizedItems.push(normalizedItem);
+  }
+
+  return normalizedItems;
 }
 
 function mapList(row) {
   return {
     id: row.id,
-    user_id: String(row.user_id),
+    userId: String(row.user_id),
     name: row.name,
-    items: row.items || [],
-    created_at: row.created_at,
+    items: normalizeListItems(row.items),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 
 function mapRecurringTask(row) {
   return {
     id: row.id,
-    user_id: String(row.user_id),
+    userId: String(row.user_id),
     title: row.title,
     categoryId: row.category_id,
     pattern: row.pattern,
     daysOfWeek: Array.isArray(row.days_of_week) ? row.days_of_week : [],
     createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 
@@ -203,19 +251,23 @@ function taskUpdates(body = {}) {
   if (typeof body.title === "string") add("title", body.title.trim());
   if (typeof body.description === "string") add("description", body.description);
   if (typeof body.priority === "string") add("priority", body.priority);
+
   if (typeof body.status === "string") {
     add("status", body.status);
     if (typeof body.isCompleted !== "boolean") {
       add("is_completed", body.status === "completed");
     }
   }
+
   if (typeof body.categoryId === "string") add("category_id", normalizeCategory(body.categoryId));
+
   if (typeof body.isCompleted === "boolean") {
     add("is_completed", body.isCompleted);
     if (typeof body.status !== "string") {
       add("status", body.isCompleted ? "completed" : "pending");
     }
   }
+
   if (typeof body.isFocus === "boolean") add("is_focus", body.isFocus);
   if (typeof body.scheduledDate === "string" || body.scheduledDate === null) add("scheduled_date", body.scheduledDate);
   if (typeof body.recurrenceId === "string" || body.recurrenceId === null) add("recurrence_id", body.recurrenceId);
@@ -233,10 +285,7 @@ apiRouter.get("/lists", async (req, res) => {
   try {
     await ensureListsTable();
     const userId = getAuthenticatedUserId(req);
-    const result = await pool.query(
-      "SELECT * FROM lists WHERE user_id = $1 ORDER BY created_at DESC",
-      [userId]
-    );
+    const result = await pool.query("SELECT * FROM lists WHERE user_id = $1 ORDER BY created_at DESC", [userId]);
 
     res.json(result.rows.map(mapList));
   } catch (err) {
@@ -267,14 +316,204 @@ apiRouter.post("/lists", async (req, res) => {
   }
 });
 
-apiRouter.delete("/lists/:id", async (req, res) => {
+apiRouter.post("/lists/:id/items", async (req, res) => {
+  try {
+    await ensureListsTable();
+    const userId = getAuthenticatedUserId(req);
+    const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+
+    if (!text) {
+      return res.status(400).json({ error: "Missing list item text" });
+    }
+
+    const newItem = {
+      id: randomUUID(),
+      text,
+      isCompleted: false,
+    };
+
+    const result = await pool.query(
+      `
+        UPDATE lists
+        SET items = (
+              CASE
+                WHEN jsonb_typeof(items) = 'array' THEN items
+                ELSE '[]'::jsonb
+              END
+            ) || $3::jsonb,
+            updated_at = NOW()
+        WHERE id = $1 AND user_id = $2
+        RETURNING *
+      `,
+      [req.params.id, userId, JSON.stringify([newItem])]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({ error: "List not found" });
+    }
+
+    res.status(201).json(mapList(result.rows[0]));
+  } catch (err) {
+    console.error("LIST ITEM CREATE ERROR:", err);
+    res.status(err.statusCode || 500).json({ error: "Failed to create list item" });
+  }
+});
+
+apiRouter.put("/lists/:id/items/:itemId", async (req, res) => {
+  try {
+    await ensureListsTable();
+    const userId = getAuthenticatedUserId(req);
+    const patch = {};
+
+    if (typeof req.body?.text === "string") {
+      const text = req.body.text.trim();
+
+      if (!text) {
+        return res.status(400).json({ error: "Missing list item text" });
+      }
+
+      patch.text = text;
+    }
+
+    if (typeof req.body?.isCompleted === "boolean") {
+      patch.isCompleted = req.body.isCompleted;
+    }
+
+    if (!Object.keys(patch).length) {
+      return res.status(400).json({ error: "No list item fields to update" });
+    }
+
+    const result = await pool.query(
+      `
+        UPDATE lists
+        SET items = COALESCE(
+              (
+                WITH current_items AS (
+                  SELECT item.value, item.ordinality
+                  FROM jsonb_array_elements(
+                    CASE
+                      WHEN jsonb_typeof(items) = 'array' THEN items
+                      ELSE '[]'::jsonb
+                    END
+                  ) WITH ORDINALITY AS item(value, ordinality)
+                ),
+                target AS (
+                  SELECT ordinality
+                  FROM current_items
+                  WHERE value->>'id' = $3
+                  ORDER BY ordinality
+                  LIMIT 1
+                )
+                SELECT jsonb_agg(
+                  CASE
+                    WHEN current_items.ordinality = target.ordinality THEN current_items.value || $4::jsonb
+                    ELSE current_items.value
+                  END
+                  ORDER BY current_items.ordinality
+                )
+                FROM current_items
+                CROSS JOIN target
+              ),
+              '[]'::jsonb
+            ),
+            updated_at = NOW()
+        WHERE id = $1
+          AND user_id = $2
+          AND EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements(
+              CASE
+                WHEN jsonb_typeof(items) = 'array' THEN items
+                ELSE '[]'::jsonb
+              END
+            ) AS item(value)
+            WHERE item.value->>'id' = $3
+          )
+        RETURNING *
+      `,
+      [req.params.id, userId, req.params.itemId, JSON.stringify(patch)]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({ error: "List item not found" });
+    }
+
+    res.json(mapList(result.rows[0]));
+  } catch (err) {
+    console.error("LIST ITEM UPDATE ERROR:", err);
+    res.status(err.statusCode || 500).json({ error: "Failed to update list item" });
+  }
+});
+
+apiRouter.delete("/lists/:id/items/:itemId", async (req, res) => {
   try {
     await ensureListsTable();
     const userId = getAuthenticatedUserId(req);
     const result = await pool.query(
-      "DELETE FROM lists WHERE id = $1 AND user_id = $2 RETURNING id",
-      [req.params.id, userId]
+      `
+        UPDATE lists
+        SET items = COALESCE(
+              (
+                WITH current_items AS (
+                  SELECT item.value, item.ordinality
+                  FROM jsonb_array_elements(
+                    CASE
+                      WHEN jsonb_typeof(items) = 'array' THEN items
+                      ELSE '[]'::jsonb
+                    END
+                  ) WITH ORDINALITY AS item(value, ordinality)
+                ),
+                target AS (
+                  SELECT ordinality
+                  FROM current_items
+                  WHERE value->>'id' = $3
+                  ORDER BY ordinality
+                  LIMIT 1
+                )
+                SELECT jsonb_agg(current_items.value ORDER BY current_items.ordinality)
+                FROM current_items
+                CROSS JOIN target
+                WHERE current_items.ordinality <> target.ordinality
+              ),
+              '[]'::jsonb
+            ),
+            updated_at = NOW()
+        WHERE id = $1
+          AND user_id = $2
+          AND EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements(
+              CASE
+                WHEN jsonb_typeof(items) = 'array' THEN items
+                ELSE '[]'::jsonb
+              END
+            ) AS item(value)
+            WHERE item.value->>'id' = $3
+          )
+        RETURNING *
+      `,
+      [req.params.id, userId, req.params.itemId]
     );
+
+    if (!result.rowCount) {
+      return res.status(404).json({ error: "List item not found" });
+    }
+
+    res.json(mapList(result.rows[0]));
+  } catch (err) {
+    console.error("LIST ITEM DELETE ERROR:", err);
+    res.status(err.statusCode || 500).json({ error: "Failed to delete list item" });
+  }
+});
+
+apiRouter.delete("/lists/:id", async (req, res) => {
+  try {
+    await ensureListsTable();
+    const userId = getAuthenticatedUserId(req);
+    const result = await pool.query("DELETE FROM lists WHERE id = $1 AND user_id = $2 RETURNING id", [
+      req.params.id,
+      userId,
+    ]);
 
     if (!result.rowCount) {
       return res.status(404).json({ error: "List not found" });
@@ -375,10 +614,10 @@ apiRouter.delete("/recurring-tasks/:id", async (req, res) => {
   try {
     await ensureRecurringTasksTable();
     const userId = getAuthenticatedUserId(req);
-    const result = await pool.query(
-      "DELETE FROM recurring_tasks WHERE id = $1 AND user_id = $2 RETURNING id",
-      [req.params.id, userId]
-    );
+    const result = await pool.query("DELETE FROM recurring_tasks WHERE id = $1 AND user_id = $2 RETURNING id", [
+      req.params.id,
+      userId,
+    ]);
 
     if (!result.rowCount) {
       return res.status(404).json({ error: "Recurring task not found" });
@@ -395,10 +634,7 @@ apiRouter.get("/tasks", async (req, res) => {
   try {
     await ensureTasksTable();
     const userId = getAuthenticatedUserId(req);
-    const result = await pool.query(
-      "SELECT * FROM tasks WHERE user_id = $1 ORDER BY created_at DESC",
-      [userId]
-    );
+    const result = await pool.query("SELECT * FROM tasks WHERE user_id = $1 ORDER BY created_at DESC", [userId]);
 
     res.json(result.rows.map(mapTask));
   } catch (err) {
@@ -483,10 +719,10 @@ apiRouter.delete("/tasks/:id", async (req, res) => {
   try {
     await ensureTasksTable();
     const userId = getAuthenticatedUserId(req);
-    const result = await pool.query(
-      "DELETE FROM tasks WHERE id = $1 AND user_id = $2 RETURNING id",
-      [req.params.id, userId]
-    );
+    const result = await pool.query("DELETE FROM tasks WHERE id = $1 AND user_id = $2 RETURNING id", [
+      req.params.id,
+      userId,
+    ]);
 
     if (!result.rowCount) {
       return res.status(404).json({ error: "Task not found" });
